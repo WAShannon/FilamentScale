@@ -30,7 +30,7 @@ Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 OneButton encoderButton(ENCODER_SW_PIN, true);
 
 // Initial calibration factor (this needs to be adjusted for your specific setup)
-float calibration_factor = 2280.0;
+float calibration_factor = -1185.0;
 float new_calibration_factor = calibration_factor;  // New calibration factor to be adjusted
 
 // Filament details (adjust these values as per your filament specifications)
@@ -168,7 +168,7 @@ void updateDisplay() {
       tft.print("New Factor: ");
       tft.println(new_calibration_factor);
       tft.print("Total Weight: ");
-      tft.println(total_weight);
+      tft.println(total_weight,3);
       break;
     }
     case SPOOL_MODE: {

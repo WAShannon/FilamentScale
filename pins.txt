@@ -1,0 +1,19 @@
+HX711 Load Cell Amplifier:
+  - DT (Data)  : GPIO 32
+  - SCK (Clock): GPIO 33
+
+Rotary Encoder:
+  - CLK (Clock)    : GPIO 16
+  - DT (Data)      : GPIO 17
+  - SW (Switch)    : GPIO 19
+
+ST7735 Display:
+  - CS (Chip Select): GPIO 5
+  - RST (Reset)     : GPIO 15
+  - DC (Data/Command): GPIO 2
+  - MOSI (Data Input): GPIO 23
+  - SCK (Clock)     : GPIO 18
+
+Power Supply:
+  - VCC: 3.3V or 5V
+  - GND: Ground
