@@ -30,11 +30,13 @@ Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 OneButton encoderButton(ENCODER_SW_PIN, true);
 
 // Initial calibration factor (this needs to be adjusted for your specific setup)
-float calibration_factor = -1085.0;
+float calibration_factor = -700.0;
 float new_calibration_factor = calibration_factor;  // New calibration factor to be adjusted
 
 // Filament details
 float empty_spool_weight = 250.0; // in grams (default value)
+float new_empty_spool_weight = empty_spool_weight; // Initialize with current value
+float previous_empty_spool_weight = empty_spool_weight;
 const float filament_density = 1.24;    // in g/cm^3 for PLA (adjust for your material)
 const float filament_diameter = 1.75;   // in mm
 
@@ -49,7 +51,8 @@ const long interval = 250;  // Interval for updating the display
 // Define states for the state machine
 enum State {
   CALIBRATION_MODE,
-  SPOOL_MODE
+  SPOOL_MODE,
+  MTSPOOL_MODE
 };
 
 // Initial state of the state machine (default to SPOOL_MODE)
@@ -70,6 +73,17 @@ float previous_total_weight_current = NAN;
 float previous_total_weight_new = NAN;
 const float CAL_FACTOR_DELTA = 0.0005f;
 const float TOTAL_WEIGHT_DELTA = 0.05f;
+
+// Variables to track last update time and display changes
+unsigned long lastUpdateMillis = 0;
+const unsigned long UPDATE_TIMEOUT = 30000; // 30 seconds
+bool displayChanged = false;
+
+// Constants for smoothing
+const int SMA_WINDOW_SIZE = 5; // Number of readings to average
+float weightBuffer[SMA_WINDOW_SIZE];
+float lengthBuffer[SMA_WINDOW_SIZE];
+int bufferIndex = 0;
 
 // Function prototypes
 void setup();
@@ -99,15 +113,28 @@ void setup() {
   tft.setRotation(1);         // Rotate the screen by 270 degrees
   tft.fillScreen(ST7735_BLACK);
   tft.setTextColor(ST7735_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(0, 0);
-  tft.println("Initializing...");
 
   // Initialize the encoder button
   encoderButton.attachClick(applyNewCalibrationFactor);
   encoderButton.attachLongPressStart(switchMode);
 
+  // Initialize SMA buffers
+  for (int i = 0; i < SMA_WINDOW_SIZE; i++) {
+    weightBuffer[i] = 0.0;
+    lengthBuffer[i] = 0.0;
+  }
+
   Serial.println("Load cell and encoder initialized. Place the spool on the load cell.");
+}
+
+void adjustEmptySpoolWeight() {
+  // Adjust new_empty_spool_weight using encoder
+  new_empty_spool_weight += encoderPos; // Example adjustment
+  encoderPos = 0; // Reset encoder position after adjustment
+
+  if (currentState == MTSPOOL_MODE) {
+    applyNewCalibrationFactor(); // Save the new weight value when in MTSPOOL_MODE
+  }
 }
 
 void loop() {
@@ -125,8 +152,13 @@ void loop() {
       break;
     case SPOOL_MODE:
       // Handle spool mode
-      adjustSpoolWeight();
+      //adjustSpoolWeight();
       break;
+    case MTSPOOL_MODE: {
+      // Handle MTSPOOL mode
+      adjustEmptySpoolWeight();
+      break;
+    }
   }
 
   // Update display
@@ -136,14 +168,16 @@ void loop() {
   }
 }
 
+
+
 void readEncoder() {
   int currentEncoderCLKState = digitalRead(ENCODER_CLK_PIN);
   if (currentEncoderCLKState != lastEncoderCLKState && currentEncoderCLKState == LOW) {
     // If the CLK signal has changed and is now LOW
     if (digitalRead(ENCODER_DT_PIN) == HIGH) {
-      encoderPos++;
-    } else {
       encoderPos--;
+    } else {
+      encoderPos++;
     }
     Serial.print("Encoder Position: ");
     Serial.println(encoderPos);
@@ -157,14 +191,6 @@ void adjustCalibrationFactor() {
   encoderPos = 0; // Reset encoder position after adjustment
   Serial.print("Adjusted Calibration Factor: ");
   Serial.println(new_calibration_factor);
-}
-
-void adjustSpoolWeight() {
-  // Adjust empty spool weight using encoder
-  empty_spool_weight += encoderPos; // Example adjustment
-  encoderPos = 0; // Reset encoder position after adjustment
-  Serial.print("Adjusted Spool Weight: ");
-  Serial.println(empty_spool_weight);
 }
 
 void updateDisplay() {
@@ -242,7 +268,12 @@ void updateDisplay() {
       // Read raw weight and compute filament values
       float raw_weight = scale.get_units();
       float current_weight = raw_weight - empty_spool_weight;
-      if (current_weight < 0) current_weight = 0;
+
+      if (current_weight < 0) {
+        tft.fillScreen(ST7735_BLACK); // Blank the screen if current weight is negative
+        displayChanged = true; // Set flag to indicate display changed
+        break;
+      }
 
       float filament_length = 0.0f;
       // filament_diameter in mm -> convert to cm for g/cm^3 density
@@ -283,6 +314,25 @@ void updateDisplay() {
         tft.print(lbuf);
         previous_display_length = filament_length;
       }
+
+      break;
+    }
+    case MTSPOOL_MODE: {
+      // Display current and new empty_spool_weight
+      //if (isnan(previous_empty_spool_weight) || fabs(empty_spool_weight - previous_empty_spool_weight) > WEIGHT_CHANGE_THRESHOLD) {
+        char buf1[32];
+        snprintf(buf1, sizeof(buf1), "Empty Spool Weight: %6.2f g", empty_spool_weight);
+        tft.setCursor(0, 12);
+        tft.print(buf1);
+
+        char buf2[32];
+        snprintf(buf2, sizeof(buf2), "New Spool Weight: %6.2f g", new_empty_spool_weight);
+        tft.setCursor(0, 28);
+        tft.print(buf2);
+
+        previous_empty_spool_weight = empty_spool_weight;
+      //}
+
       break;
     }
   }
@@ -291,8 +341,11 @@ void updateDisplay() {
 void switchMode() {
   // Toggle between modes on long press
   if (currentState == CALIBRATION_MODE) {
+    currentState = MTSPOOL_MODE;
+  } else if (currentState == MTSPOOL_MODE) 
+  {
     currentState = SPOOL_MODE;
-  } else {
+  } else {  
     currentState = CALIBRATION_MODE;
   }
   Serial.print("Switched to Mode: ");
@@ -301,8 +354,5 @@ void switchMode() {
 
 void applyNewCalibrationFactor() {
   // Apply new calibration factor on short press
-  calibration_factor = new_calibration_factor;
-  scale.set_scale(calibration_factor); // Apply new calibration factor
-  Serial.print("New Calibration Factor Applied: ");
-  Serial.println(calibration_factor);
+  empty_spool_weight = new_empty_spool_weight; // Save the new weight value
 }
