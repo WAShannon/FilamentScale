@@ -3,15 +3,19 @@
 #include <Adafruit_ST7735.h>
 #include <SPI.h>
 #include <OneButton.h>
+#include <Preferences.h>
+  #include <nvs_flash.h>
 
-// Pin definitions for the load cell (ESP32)
-#define LOADCELL_DOUT_PIN 32
-#define LOADCELL_SCK_PIN 33
+// HX711 pins
+#define DT  32
+#define SCK 33
+
+HX711 scale;
 
 // Pin definitions for the rotary encoder (ESP32)
-#define ENCODER_CLK_PIN 16
-#define ENCODER_DT_PIN 17
-#define ENCODER_SW_PIN 19
+#define ENCODER_CLK 16
+#define ENCODER_DT 17
+#define ENCODER_SW 19
 
 // Pin definitions for the ST7735 (ESP32)
 #define TFT_CS     5
@@ -20,339 +24,250 @@
 #define TFT_MOSI   23
 #define TFT_SCK    18
 
-// Create an instance of the HX711 class
-HX711 scale;
+int ticks = 0;
 
-// Create an instance of the ST7735 class
-Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+volatile int calibrationFactor = -1198; // adjustable with encoder
+volatile long calibrationOffset = 55076;
+volatile long lastEncoderCLK = LOW;
+volatile bool tareRequested = false;
 
-// Create an instance of the OneButton class
-OneButton encoderButton(ENCODER_SW_PIN, true);
+// Debounce variables
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 4; // milliseconds
 
-// Initial calibration factor (this needs to be adjusted for your specific setup)
-float calibration_factor = -700.0;
-float new_calibration_factor = calibration_factor;  // New calibration factor to be adjusted
+// Preferences namespace and key for storing empty spool weight
+#define PREFERENCES_NAMESPACE "storage"
+#define EMPTY_SPOOL_WEIGHT_KEY "mtsw"
+Preferences preferences;
+
+// TFT display setup
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, TFT_RST);
 
 // Filament details
-float empty_spool_weight = 250.0; // in grams (default value)
-float new_empty_spool_weight = empty_spool_weight; // Initialize with current value
-float previous_empty_spool_weight = empty_spool_weight;
+int empty_spool_weight = 250; // in grams (default value)
 const float filament_density = 1.24;    // in g/cm^3 for PLA (adjust for your material)
 const float filament_diameter = 1.75;   // in mm
 
-// Variables for encoder handling
-int lastEncoderCLKState = LOW; // Last state of the CLK pin
-int encoderPos = 0;  // Current position of the encoder
+// Threshold values for display updates
+const float weightThreshold = 0.1;
+const float lengthThreshold = 0.1;
 
-// Timing variables
-unsigned long previousMillis = 0;
-const long interval = 250;  // Interval for updating the display
+static float lastWeight = -1.0;
+static float lastLength = -1.0;
+static float lastSpoolWeight = -1.0;
 
-// Define states for the state machine
-enum State {
-  CALIBRATION_MODE,
-  SPOOL_MODE,
-  MTSPOOL_MODE
-};
-
-// Initial state of the state machine (default to SPOOL_MODE)
-State currentState = SPOOL_MODE;
-
-// --- display caching to reduce flicker ---
-float previous_display_weight = NAN;
-float previous_display_length = NAN;
-State previous_display_state = (State)-1;
-const float WEIGHT_CHANGE_THRESHOLD = 0.05f;  // grams
-const float LENGTH_CHANGE_THRESHOLD = 0.01f;  // meters
-
-// calibration-mode specific cache to avoid redraws
-float previous_calibration_factor = NAN;
-float previous_new_calibration_factor = NAN;
-// replaced single total cache with separate current/new caches
-float previous_total_weight_current = NAN;
-float previous_total_weight_new = NAN;
-const float CAL_FACTOR_DELTA = 0.0005f;
-const float TOTAL_WEIGHT_DELTA = 0.05f;
-
-// Variables to track last update time and display changes
-unsigned long lastUpdateMillis = 0;
-const unsigned long UPDATE_TIMEOUT = 30000; // 30 seconds
-bool displayChanged = false;
-
-// Constants for smoothing
-const int SMA_WINDOW_SIZE = 5; // Number of readings to average
-float weightBuffer[SMA_WINDOW_SIZE];
-float lengthBuffer[SMA_WINDOW_SIZE];
+// Rolling average variables
+const int rollingAverageSize = 5;
+float weightBuffer[rollingAverageSize];
 int bufferIndex = 0;
 
-// Function prototypes
-void setup();
-void loop();
-void adjustCalibrationFactor();
-void adjustSpoolWeight();
-void updateDisplay();
-void switchMode();
-void applyNewCalibrationFactor();
-void readEncoder();
+unsigned long lastSerialUpdate = 0; // Timer variable to track the last update time
+unsigned long lastDisplayUpdate = 0; // Timer variable to track the last display update
+
+// Configurable variable for timer interval
+const unsigned long weightReadInterval = 500; // milliseconds (0.5 seconds)
+const unsigned long blankScreenDelay = 30000; // milliseconds (30 seconds)
+
+// Function to calculate filament length
+float calculateFilamentLength(float weight) {
+  float radius_cm = (filament_diameter / 20.0); // mm → cm, then /2 for radius
+  float area_cm2 = PI * radius_cm * radius_cm;
+  float volume_cm3 = weight / filament_density;
+  float res = volume_cm3 / area_cm2 / 100;  // length in m
+  if (res < 0) {
+    return 0;
+  }
+  return res;
+}
+
+void IRAM_ATTR encoderISR() {
+  // Handle the encoder state change
+  static long lastStateA = HIGH;
+  static long lastStateB = HIGH;
+
+  long currentStateA = digitalRead(ENCODER_CLK);
+  long currentStateB = digitalRead(ENCODER_DT);
+  if ((currentStateA != lastStateA) || (currentStateB != lastStateB)) {
+    if ((currentStateA == LOW) && (lastStateA == HIGH)) {
+      if (currentStateB == LOW) {
+        empty_spool_weight--; // Clockwise rotation
+      } else {
+        empty_spool_weight++; // Counterclockwise rotation
+      }
+    }
+
+    lastDebounceTime = millis();
+  }
+
+  lastStateA = currentStateA;
+  lastStateB = currentStateB;
+}
+
+void handleSingleClick() {
+  tft.fillScreen(ST7735_GREEN);
+  Serial.println("TARE");
+  scale.tare(); // Tare the scale
+}
+
+void handleLongPress() {
+    preferences.begin(PREFERENCES_NAMESPACE, false);
+
+  if (preferences.putInt(EMPTY_SPOOL_WEIGHT_KEY, empty_spool_weight)) {
+     preferences.end();
+    Serial.println("Saved empty spool weight: " + String(empty_spool_weight) + " g")  ; // Save to Preferences
+  tft.fillScreen(ST7735_BLUE);
+}
+  preferences.end();
+}
+
+void loadEmptySpoolWeight() {
+  if (preferences.isKey(EMPTY_SPOOL_WEIGHT_KEY)) {
+    empty_spool_weight = preferences.getInt(EMPTY_SPOOL_WEIGHT_KEY, 250); // Load from Preferences
+    Serial.println("Loaded empty spool weight: " + String(empty_spool_weight) + " g");
+  } else {
+    empty_spool_weight = 250; // Default value
+    Serial.println("No saved empty spool weight found, using default: " + String(empty_spool_weight) + " g");
+  }
+  //Serial.println("Loaded empty spool weight: " + String(empty_spool_weight) + " g");
+}
+
+OneButton button(ENCODER_SW, true);
+
+unsigned long lastWeightReadTime = millis(); // Declare and initialize lastWeightReadTime
+unsigned long lastButtonTickTime = 0; // Timer variable to track the last button tick time
 
 void setup() {
-  Serial.begin(115200); // ESP32 uses higher baud rates
+  Serial.begin(115200);
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      Serial.println("Erasing NVS...");
+      nvs_flash_erase();
+      nvs_flash_init();
+  }
+  Serial.println("NVS initialized.");
 
-  // Initialize load cell
-  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-  scale.set_scale(calibration_factor);  // Set the calibration factor
-  scale.tare();                         // Reset the scale to 0
+//Preferences preferences;
 
-  // Initialize rotary encoder pins
-  pinMode(ENCODER_CLK_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_DT_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
-
-  // Initialize the display
+  // HX711 init
+  scale.begin(DT, SCK);
+  // Encoder pins
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DT), encoderISR, CHANGE);
+  scale.set_scale(calibrationFactor); // start with default
+  scale.set_offset(calibrationOffset);
+  lastWeightReadTime = millis(); // Initialize lastWeightReadTime
+  
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  empty_spool_weight = preferences.getInt(EMPTY_SPOOL_WEIGHT_KEY, 0);
+  //loadEmptySpoolWeight(); // Load empty_spool_weight from Preferences
+  Serial.println("Loaded empty spool weight: " + String(empty_spool_weight) + " g");
+  preferences.end();
+  lastSpoolWeight = empty_spool_weight;
+  // Initialize TFT display
   tft.initR(INITR_BLACKTAB);  // Initialize a ST7735S chip, black tab
   tft.setRotation(1);         // Rotate the screen by 270 degrees
   tft.fillScreen(ST7735_BLACK);
   tft.setTextColor(ST7735_WHITE);
 
-  // Initialize the encoder button
-  encoderButton.attachClick(applyNewCalibrationFactor);
-  encoderButton.attachLongPressStart(switchMode);
-
-  // Initialize SMA buffers
-  for (int i = 0; i < SMA_WINDOW_SIZE; i++) {
+  // Initialize weight buffer
+  for (int i = 0; i < rollingAverageSize; i++) {
     weightBuffer[i] = 0.0;
-    lengthBuffer[i] = 0.0;
   }
 
-  Serial.println("Load cell and encoder initialized. Place the spool on the load cell.");
-}
+  lastWeightReadTime = millis(); // Initialize the last weight read time
+  lastDisplayUpdate = millis(); // Initialize the last display update time
 
-void adjustEmptySpoolWeight() {
-  // Adjust new_empty_spool_weight using encoder
-  new_empty_spool_weight += encoderPos; // Example adjustment
-  encoderPos = 0; // Reset encoder position after adjustment
-
-  if (currentState == MTSPOOL_MODE) {
-    applyNewCalibrationFactor(); // Save the new weight value when in MTSPOOL_MODE
-  }
+  // Attach button events
+  button.attachClick(handleSingleClick);
+  button.attachLongPressStart(handleLongPress);
+  Serial.println("Setup complete.");
 }
 
 void loop() {
-  // Call the OneButton tick function to detect button events
-  encoderButton.tick();
+  unsigned long currentTime = millis();
 
-  // Read the encoder
-  readEncoder();
+    button.tick();
+  // --- Read weight ---
+  if (currentTime - lastWeightReadTime >= weightReadInterval) {
+    if (scale.is_ready()) {
+      //Serial.println("HX711 ready");
+      float newWeight = scale.get_units(1); // average of 5 reads
 
-  // Perform actions based on the current mode
-  switch (currentState) {
-    case CALIBRATION_MODE:
-      // Handle calibration mode
-      adjustCalibrationFactor();
-      break;
-    case SPOOL_MODE:
-      // Handle spool mode
-      //adjustSpoolWeight();
-      break;
-    case MTSPOOL_MODE: {
-      // Handle MTSPOOL mode
-      adjustEmptySpoolWeight();
-      break;
-    }
-  }
+      // Add new weight to buffer and calculate average
+      weightBuffer[bufferIndex] = newWeight;
+      bufferIndex = (bufferIndex + 1) % rollingAverageSize;
+      float totalWeight = 0.0;
+      for (int i = 0; i < rollingAverageSize; i++) {
+        totalWeight += weightBuffer[i];
+      }
+      float averageWeight = (totalWeight / rollingAverageSize) - empty_spool_weight; // Subtract empty spool weight
+//Serial.print("Average Weight: ");
+//Serial.println(averageWeight);
+      // Calculate filament length
+      float filamentLength = calculateFilamentLength(averageWeight);
+//Serial.print("Filament Length: ");
+//Serial.println(filamentLength); 
+      if (averageWeight <= 0) {
+        tft.fillScreen(ST7735_BLACK); // Clear the screen if weight is negative
+        //Serial.println("NO WEIGHT");
+        lastWeight = -1.0; // Reset lastWeight to force update when weight is positive again
+        lastLength = -1.0; // Reset lastLength to force update when weight is positive again      
+      } else {
 
-  // Update display
-  if (millis() - previousMillis >= interval) {
-    updateDisplay();
-    previousMillis = millis();
-  }
-}
-
-
-
-void readEncoder() {
-  int currentEncoderCLKState = digitalRead(ENCODER_CLK_PIN);
-  if (currentEncoderCLKState != lastEncoderCLKState && currentEncoderCLKState == LOW) {
-    // If the CLK signal has changed and is now LOW
-    if (digitalRead(ENCODER_DT_PIN) == HIGH) {
-      encoderPos--;
-    } else {
-      encoderPos++;
-    }
-    Serial.print("Encoder Position: ");
-    Serial.println(encoderPos);
-  }
-  lastEncoderCLKState = currentEncoderCLKState;
-}
-
-void adjustCalibrationFactor() {
-  // Adjust calibration factor using encoder
-  new_calibration_factor += encoderPos * 10; // Example adjustment
-  encoderPos = 0; // Reset encoder position after adjustment
-  Serial.print("Adjusted Calibration Factor: ");
-  Serial.println(new_calibration_factor);
-}
-
-void updateDisplay() {
-  // Only do a full clear when the mode changes
-  if (currentState != previous_display_state) {
-    tft.fillScreen(ST7735_BLACK);
-    previous_display_weight = NAN;
-    previous_display_length = NAN;
-    previous_display_state = currentState;
-    // reset calibration caches too so first entry draws everything
-    previous_calibration_factor = NAN;
-    previous_new_calibration_factor = NAN;
-    previous_total_weight_current = NAN;
-    previous_total_weight_new = NAN;
-  }
-
-  tft.setTextWrap(false); // avoid wrapping side-effects
-
-  switch (currentState) {
-    case CALIBRATION_MODE: {
-      // read units using the currently-applied calibration
-      float units_current = scale.get_units();
-      // total as reported with the current factor
-      float total_current = units_current;
-      // estimate total using the new calibration factor (avoid divide-by-zero)
-      float total_new = total_current;
-      if (new_calibration_factor != 0.0f) {
-        total_new = units_current * (calibration_factor / new_calibration_factor);
+        // Update display only when necessary
+        if (abs(averageWeight - lastWeight) > weightThreshold) {
+          tft.fillRect(10, 20, tft.width(), 40, ST7735_BLACK); // Clear the area where weight is displayed
+          tft.setTextSize(3);
+          tft.setCursor(10, 20);
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%4.1f g", averageWeight);
+          tft.print(buf);
+          lastWeight = averageWeight;
+          Serial.println("WEIGHT");
+        }
+        if (abs(filamentLength - lastLength) > lengthThreshold) {
+          Serial.print("LENGTH ");
+          Serial.println(abs(filamentLength - lastLength));
+          tft.fillRect(10, 60, tft.width(), 40, ST7735_BLACK); // Clear the area where filament length is displayed
+          tft.setTextSize(3);
+          tft.setCursor(10, 60);
+          char buf2[16];
+          snprintf(buf2, sizeof(buf2), "%4.1f m", filamentLength); 
+          tft.print(buf2);
+          lastLength = filamentLength;
+        }
       }
 
-       // Only redraw small value areas when the value actually changes.
-       // Header/top label drawn only on mode change above (screen was cleared).
-       tft.setTextSize(1);
-       tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
-
-       // Cur Factor
-       if (isnan(previous_calibration_factor) || fabs(calibration_factor - previous_calibration_factor) > CAL_FACTOR_DELTA) {
-         char buf1[32];
-         snprintf(buf1, sizeof(buf1), "Cur Factor: %5.0f", calibration_factor);
-         tft.setCursor(0, 12);
-         tft.print(buf1);
-         previous_calibration_factor = calibration_factor;
-       }
-
-       // New Factor
-       if (isnan(previous_new_calibration_factor) || fabs(new_calibration_factor - previous_new_calibration_factor) > CAL_FACTOR_DELTA) {
-         char buf2[32];
-         snprintf(buf2, sizeof(buf2), "New Factor: %5.0f", new_calibration_factor);
-         tft.setCursor(0, 28);
-         tft.print(buf2);
-         previous_new_calibration_factor = new_calibration_factor;
-       }
-
-      // Total with current factor
-      if (isnan(previous_total_weight_current) || fabs(total_current - previous_total_weight_current) > TOTAL_WEIGHT_DELTA) {
-        char buf3[32];
-        snprintf(buf3, sizeof(buf3), "Total (cur): %6.2f g  ", total_current);
-        tft.setCursor(0, 44);
-        tft.print(buf3);
-        previous_total_weight_current = total_current;
+      // Check if one second has passed since the last update
+      if (currentTime - lastSerialUpdate >= 1000) {
+        Serial.printf("Weight: %.1f g, Length: %.2f m %d g spool\n", averageWeight, filamentLength, empty_spool_weight);
+        lastSerialUpdate = currentTime;
       }
-      // Estimated total with new factor
-      if (isnan(previous_total_weight_new) || fabs(total_new - previous_total_weight_new) > TOTAL_WEIGHT_DELTA) {
-        char buf4[32];
-        snprintf(buf4, sizeof(buf4), "Total (new): %6.2f g  ", total_new);
-        tft.setCursor(0, 56);
-        tft.print(buf4);
-        previous_total_weight_new = total_new;
-      }
+    
+   
+  } else {
+    //Serial.print("HX711 not ready: ");
+  }
+ lastWeightReadTime = currentTime; // Update the last weight read time
+  // Display empty spool weight if it has changed
+  if (empty_spool_weight != lastSpoolWeight) {
+    tft.fillRect(0, 120, tft.width(), 20, ST7735_BLACK); // Clear the area where spool weight is displayed
+    tft.setTextSize(1); // Set text size to 1
+    char buf3[16];
+    snprintf(buf3, sizeof(buf3), " Spool: %d g", empty_spool_weight);
+    tft.setCursor(0, 120);
+    tft.print(buf3);
+    lastSpoolWeight = empty_spool_weight;
+  }
 
-       break;
-     }
-
-    case SPOOL_MODE: {
-      // Read raw weight and compute filament values
-      float raw_weight = scale.get_units();
-      float current_weight = raw_weight - empty_spool_weight;
-
-      if (current_weight < 0) {
-        tft.fillScreen(ST7735_BLACK); // Blank the screen if current weight is negative
-        displayChanged = true; // Set flag to indicate display changed
-        break;
-      }
-
-      float filament_length = 0.0f;
-      // filament_diameter in mm -> convert to cm for g/cm^3 density
-      float radius_cm = (filament_diameter / 10.0f) / 2.0f;
-      float area_cm2 = PI * radius_cm * radius_cm;
-      float volume_cm3 = 0;
-      if (filament_density > 0) volume_cm3 = current_weight / filament_density;
-      float length_m = 0;
-      if (area_cm2 > 0) length_m = (volume_cm3 / area_cm2) / 100.0f;
-      filament_length = length_m;
-
-      // Only update moving numbers if they changed enough
-      bool weight_changed = isnan(previous_display_weight) || fabs(previous_display_weight - current_weight) >= WEIGHT_CHANGE_THRESHOLD;
-      bool length_changed = isnan(previous_display_length) || fabs(previous_display_length - filament_length) >= LENGTH_CHANGE_THRESHOLD;
-
-      if (weight_changed) {
-        // Clear a larger area for the big weight text to avoid ghosting
-        tft.fillRect(0, 16, tft.width(), 72, ST7735_BLACK);
-        tft.setTextSize(3);            
-        tft.setCursor(0, 16);
-        tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
-        char wbuf[24];
-        // show filament mass in grams without label
-        snprintf(wbuf, sizeof(wbuf), "%7.2f g", current_weight);
-        tft.print(wbuf);
-        previous_display_weight = current_weight;
-      }
-
-      if (length_changed) {
-        // Clear only the rectangle used for the length value
-        tft.fillRect(0, 88, tft.width(), 40, ST7735_BLACK);
-        tft.setTextSize(3);              
-        tft.setCursor(0, 88);
-        tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
-        char lbuf[32];
-        // show filament length in meters without label
-        snprintf(lbuf, sizeof(lbuf), "%7.2f m", filament_length);
-        tft.print(lbuf);
-        previous_display_length = filament_length;
-      }
-
-      break;
-    }
-    case MTSPOOL_MODE: {
-      // Display current and new empty_spool_weight
-      //if (isnan(previous_empty_spool_weight) || fabs(empty_spool_weight - previous_empty_spool_weight) > WEIGHT_CHANGE_THRESHOLD) {
-        char buf1[32];
-        snprintf(buf1, sizeof(buf1), "Empty Spool Weight: %6.2f g", empty_spool_weight);
-        tft.setCursor(0, 12);
-        tft.print(buf1);
-
-        char buf2[32];
-        snprintf(buf2, sizeof(buf2), "New Spool Weight: %6.2f g", new_empty_spool_weight);
-        tft.setCursor(0, 28);
-        tft.print(buf2);
-
-        previous_empty_spool_weight = empty_spool_weight;
-      //}
-
-      break;
-    }
+  // Blank the screen if it goes for 30 seconds without being updated
+  if (currentTime - lastDisplayUpdate > blankScreenDelay) {
+    tft.fillScreen(ST7735_BLACK); // Clear the screen
+    Serial.println("BLANK SCREEN");
+    lastDisplayUpdate = currentTime; // Reset the display update time
   }
 }
-
-void switchMode() {
-  // Toggle between modes on long press
-  if (currentState == CALIBRATION_MODE) {
-    currentState = MTSPOOL_MODE;
-  } else if (currentState == MTSPOOL_MODE) 
-  {
-    currentState = SPOOL_MODE;
-  } else {  
-    currentState = CALIBRATION_MODE;
-  }
-  Serial.print("Switched to Mode: ");
-  Serial.println(currentState == CALIBRATION_MODE ? "Calibration Mode" : "Spool Mode");
 }
 
-void applyNewCalibrationFactor() {
-  // Apply new calibration factor on short press
-  empty_spool_weight = new_empty_spool_weight; // Save the new weight value
-}
