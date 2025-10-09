@@ -49,7 +49,7 @@ const float filament_density = 1.24;    // in g/cm^3 for PLA (adjust for your ma
 const float filament_diameter = 1.75;   // in mm
 
 // Threshold values for display updates
-const float weightThreshold = 0.1;
+const float weightThreshold = 0.3;
 const float lengthThreshold = 0.1;
 
 static float lastWeight = -1.0;
@@ -104,20 +104,39 @@ void IRAM_ATTR encoderISR() {
 }
 
 void handleSingleClick() {
-  tft.fillScreen(ST7735_GREEN);
-  Serial.println("TARE");
+  tft.fillScreen(ST7735_BLACK); // Clear the screen
+  tft.setTextSize(2);
+  tft.setTextColor(ST7735_WHITE);
+  tft.setCursor(tft.width() / 2 - 40, tft.height() / 2 - 10);
+  tft.println("TARE"); // Display "TARE" in the center of the screen
+
   scale.tare(); // Tare the scale
+
+  delay(1000); // Wait for 1 second
+
+  tft.fillScreen(ST7735_BLACK); // Clear the screen after 1 second
 }
 
 void handleLongPress() {
     preferences.begin(PREFERENCES_NAMESPACE, false);
 
   if (preferences.putInt(EMPTY_SPOOL_WEIGHT_KEY, empty_spool_weight)) {
-     preferences.end();
-    Serial.println("Saved empty spool weight: " + String(empty_spool_weight) + " g")  ; // Save to Preferences
-  tft.fillScreen(ST7735_BLUE);
-}
-  preferences.end();
+    preferences.end();
+    Serial.println("Saved empty spool weight: " + String(empty_spool_weight) + " g"); // Save to Preferences
+
+    tft.fillScreen(ST7735_BLACK); // Clear the screen
+    tft.setTextSize(2);
+    tft.setTextColor(ST7735_WHITE);
+    tft.setCursor(tft.width() / 2 - 40, tft.height() / 2 - 10);
+    tft.println("SAVED"); // Display "SAVED" in the center of the screen
+
+    delay(2000); // Wait for 2 seconds
+
+    tft.fillScreen(ST7735_BLACK); // Clear the screen after 2 seconds
+  } else {
+    preferences.end();
+    Serial.println("Failed to save empty spool weight");
+  }
 }
 
 void loadEmptySpoolWeight() {
@@ -213,7 +232,7 @@ void loop() {
         tft.fillScreen(ST7735_BLACK); // Clear the screen if weight is negative
         //Serial.println("NO WEIGHT");
         lastWeight = -1.0; // Reset lastWeight to force update when weight is positive again
-        lastLength = -1.0; // Reset lastLength to force update when weight is positive again      
+        lastLength = -1.0; // Reset lastLength to force update when length is positive again      
       } else {
 
         // Update display only when necessary
